@@ -1064,6 +1064,7 @@ name is rohan hello my</textarea>
         this.lossData = [];
         this.epochLabels = [];
         this.chatHistory = [];
+        this.knowledgeBase = [];
 
         this.initElements();
         this.initChart();
@@ -1332,7 +1333,9 @@ name is rohan hello my</textarea>
           }
         }
 
-        // Build transition table from training data for better predictions
+        // Build knowledge base for retrieval-based QA
+        this.buildKnowledgeBase(sentences);
+        // Build transition table for next-token prediction demo
         this.trainer.buildTransitions(sentences);
 
         // Training complete
@@ -1406,14 +1409,15 @@ name is rohan hello my</textarea>
         this.els.chatPanel.classList.add('hidden');
         this.els.chatHistory.innerHTML = `
           <div class="chat-msg-model text-sm text-slate-300">
-            Hello! I've been trained on your dataset. Type a sequence of words from the vocabulary and I'll predict the next token.
+            Hello! I've been trained on your dataset. Ask me anything about the training data.
+            <br><span class="text-xs text-slate-500">Tip: Use "Q: question A: answer" format in training data for best results.</span>
           </div>
         `;
         this.chatHistory = [];
       }
 
       async sendMessage() {
-        const text = this.els.chatInput.value.trim();
+        const text = this.els.chatInput.value.trim().toLowerCase();
         if (!text || !this.model) return;
 
         // Add user message
@@ -1422,39 +1426,106 @@ name is rohan hello my</textarea>
 
         // Show typing indicator
         const typingId = this.showTypingIndicator();
-
-        // Simulate inference delay
         await new Promise(r => setTimeout(r, 600));
         this.removeTypingIndicator(typingId);
 
-        // Run inference - match notebook: output[:, -1, :] then argmax
-        const tokens = this.trainer.tokenize(text);
-        if (tokens.length === 0) {
-          this.addChatMessage("I don't recognize those words. Try words from the vocabulary.", 'model');
+        // === RETRIEVAL-BASED QA SYSTEM ===
+        // 1. Try exact or near-exact match against knowledge base
+        const answer = this.retrieveAnswer(text);
+        if (answer) {
+          // Also show the model's next-token prediction for educational value
+          const tokens = this.trainer.tokenize(text);
+          let predictionNote = '';
+          if (tokens.length > 0) {
+            const logits = this.model.forward(tokens);
+            const lastRow = logits.rows - 1;
+            const lastLogits = [];
+            const bias = this.trainer.getBias(tokens);
+            for (let v = 0; v < this.model.vocabSize; v++) {
+              lastLogits.push(logits.get(lastRow, v) + bias[v]);
+            }
+            const predictedIdx = argmax(lastLogits);
+            const vocabEntries = Object.entries(this.vocab);
+            let predictedWord = '<UNK>';
+            for (const [word, idx] of vocabEntries) {
+              if (idx === predictedIdx) { predictedWord = word; break; }
+            }
+            predictionNote = `\n<span class="text-xs text-slate-500">[Model next-token prediction: "${predictedWord}"]</span>`;
+          }
+          this.addChatMessage(answer + predictionNote, 'model');
           return;
         }
 
-        const logits = this.model.forward(tokens);
-        // logits shape: [seq, vocabSize], take last row -> [vocabSize]
-        const lastRow = logits.rows - 1;
-        const lastLogits = [];
-        const bias = this.trainer.getBias(tokens);
-        for (let v = 0; v < this.model.vocabSize; v++) {
-          lastLogits.push(logits.get(lastRow, v) + bias[v]);
-        }
-        const predictedIdx = argmax(lastLogits);
+        // 2. Out-of-dataset: "I don't know"
+        this.addChatMessage("I don't know.", 'model');
+      }
 
-        // Map back to word
-        const vocabEntries = Object.entries(this.vocab);
-        let predictedWord = '<UNK>';
-        for (const [word, idx] of vocabEntries) {
-          if (idx === predictedIdx) {
-            predictedWord = word;
-            break;
+      // Build knowledge base from training sentences
+      // Supports two formats:
+      // 1. Q&A pairs: "Q: what is your name? A: my name is rohan"
+      // 2. Plain sentences (stored as-is for keyword retrieval)
+      buildKnowledgeBase(sentences) {
+        this.knowledgeBase = [];
+        this.wordDocFreq = {};
+
+        for (const sent of sentences) {
+          const trimmed = sent.trim();
+          if (!trimmed) continue;
+
+          const lower = trimmed.toLowerCase();
+          const qaMatch = lower.match(/^q[:\s]+(.+?)\s+a[:\s]+(.+)$/i);
+          if (qaMatch) {
+            const question = qaMatch[1].trim();
+            const answer = qaMatch[2].trim();
+            const words = question.split(/\s+/).filter(w => w.length > 0);
+            this.knowledgeBase.push({ type: 'qa', question, answer, words });
+            const uniq = new Set(words);
+            for (const w of uniq) this.wordDocFreq[w] = (this.wordDocFreq[w] || 0) + 1;
+          } else {
+            const words = lower.split(/\s+/).filter(w => w.length > 0);
+            this.knowledgeBase.push({ type: 'sentence', text: trimmed, words });
+            const uniq = new Set(words);
+            for (const w of uniq) this.wordDocFreq[w] = (this.wordDocFreq[w] || 0) + 1;
+          }
+        }
+      }
+
+      // Retrieve answer by keyword overlap matching
+      retrieveAnswer(query) {
+        if (!this.knowledgeBase || this.knowledgeBase.length === 0) return null;
+
+        const queryWords = query.split(/\s+/).filter(w => w.length > 0);
+        if (queryWords.length === 0) return null;
+
+        let bestMatch = null;
+        let bestScore = -1;
+
+        for (const entry of this.knowledgeBase) {
+          const targetWords = entry.type === 'qa' ? entry.words : entry.words;
+          const targetSet = new Set(targetWords);
+
+          // Weighted overlap: rare words (in query) count more
+          let overlap = 0;
+          let queryWeightSum = 0;
+          for (const w of queryWords) {
+            const idf = 1 / (1 + Math.log(1 + this.wordDocFreq[w] || 1));
+            queryWeightSum += idf;
+            if (targetSet.has(w)) overlap += idf;
+          }
+
+          // Score: weighted overlap / weighted max length
+          const score = overlap / Math.max(queryWeightSum, targetWords.length * 0.5);
+          if (score > bestScore) {
+            bestScore = score;
+            bestMatch = entry;
           }
         }
 
-        this.addChatMessage(`Predicted next token: "${predictedWord}"`, 'model');
+        // Threshold: require strong overlap to avoid hallucination
+        if (bestScore >= 0.4) {
+          return bestMatch.type === 'qa' ? bestMatch.answer : bestMatch.text;
+        }
+        return null;
       }
 
       addChatMessage(text, sender) {
