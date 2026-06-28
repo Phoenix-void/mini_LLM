@@ -1420,44 +1420,36 @@ name is rohan hello my</textarea>
         const text = this.els.chatInput.value.trim().toLowerCase();
         if (!text || !this.model) return;
 
-        // Add user message
         this.addChatMessage(text, 'user');
         this.els.chatInput.value = '';
 
-        // Show typing indicator
         const typingId = this.showTypingIndicator();
         await new Promise(r => setTimeout(r, 600));
         this.removeTypingIndicator(typingId);
 
-        // === RETRIEVAL-BASED QA SYSTEM ===
-        // 1. Try exact or near-exact match against knowledge base
-        const answer = this.retrieveAnswer(text);
-        if (answer) {
-          // Also show the model's next-token prediction for educational value
-          const tokens = this.trainer.tokenize(text);
-          let predictionNote = '';
-          if (tokens.length > 0) {
-            const logits = this.model.forward(tokens);
-            const lastRow = logits.rows - 1;
-            const lastLogits = [];
-            const bias = this.trainer.getBias(tokens);
-            for (let v = 0; v < this.model.vocabSize; v++) {
-              lastLogits.push(logits.get(lastRow, v) + bias[v]);
-            }
-            const predictedIdx = argmax(lastLogits);
-            const vocabEntries = Object.entries(this.vocab);
-            let predictedWord = '<UNK>';
-            for (const [word, idx] of vocabEntries) {
-              if (idx === predictedIdx) { predictedWord = word; break; }
-            }
-            predictionNote = `\n<span class="text-xs text-slate-500">[Model next-token prediction: "${predictedWord}"]</span>`;
-          }
-          this.addChatMessage(answer + predictionNote, 'model');
+        // Next-token prediction using the trained model
+        const tokens = this.trainer.tokenize(text);
+        if (tokens.length === 0) {
+          this.addChatMessage("I don't recognize those words. Try words from the vocabulary.", 'model');
           return;
         }
 
-        // 2. Out-of-dataset: "I don't know"
-        this.addChatMessage("I don't know.", 'model');
+        const logits = this.model.forward(tokens);
+        const lastRow = logits.rows - 1;
+        const lastLogits = [];
+        const bias = this.trainer.getBias(tokens);
+        for (let v = 0; v < this.model.vocabSize; v++) {
+          lastLogits.push(logits.get(lastRow, v) + bias[v]);
+        }
+        const predictedIdx = argmax(lastLogits);
+
+        const vocabEntries = Object.entries(this.vocab);
+        let predictedWord = '<UNK>';
+        for (const [word, idx] of vocabEntries) {
+          if (idx === predictedIdx) { predictedWord = word; break; }
+        }
+
+        this.addChatMessage(`Predicted next token: "${predictedWord}"`, 'model');
       }
 
       // ============================================
@@ -1671,7 +1663,7 @@ name is rohan hello my</textarea>
         } else {
           div.className = 'chat-msg-model text-sm text-slate-300';
         }
-        div.textContent = text;
+        div.innerHTML = text;
         this.els.chatHistory.appendChild(div);
         this.els.chatHistory.scrollTop = this.els.chatHistory.scrollHeight;
       }
