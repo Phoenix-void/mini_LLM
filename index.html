@@ -1460,10 +1460,55 @@ name is rohan hello my</textarea>
         this.addChatMessage("I don't know.", 'model');
       }
 
+      // ============================================
+      // KNOWLEDGE BASE & RETRIEVAL SYSTEM
+      // ============================================
+
+      // Stop words to ignore during matching
+      static STOP_WORDS = new Set(['a','an','the','is','are','was','were','be','been','being','have','has','had','do','does','did','will','would','could','should','may','might','must','shall','can','need','dare','ought','used','to','of','in','for','on','with','at','by','from','as','into','through','during','before','after','above','below','between','under','again','further','then','once','here','there','when','where','why','how','all','each','few','more','most','other','some','such','no','nor','not','only','own','same','so','than','too','very','just','also','what','which','who','whom','this','that','these','those','i','me','my','myself','we','our','ours','ourselves','you','your','yours','yourself','yourselves','he','him','his','himself','she','her','hers','herself','it','its','itself','they','them','their','theirs','themselves','am','about','if','or','because','until','while','about','against','up','down','out','off','over','under','again','further','then','once']);
+
+      // Semantic synonym map: query word -> set of equivalent words
+      static SYNONYMS = {
+        'greeting': ['hello','hi','hey','greetings','welcome'],
+        'hello': ['greeting','hi','hey'],
+        'name': ['called','named','call'],
+        'rohan': ['name'],
+        'how': ['what','way','manner'],
+        'are': ['is','am','was','were'],
+        'you': ['your','yours','u'],
+        'your': ['you','yours'],
+        'word': ['words','term','phrase'],
+        'used': ['use','using','utilized'],
+        'by': ['from','of','via']
+      };
+
+      // Extract meaningful tokens from text (stop words removed, synonyms expanded)
+      extractTokens(text) {
+        const words = text.toLowerCase().split(/\s+/).filter(w => w.length > 0);
+        const tokens = [];
+        for (const w of words) {
+          const clean = w.replace(/[^a-z0-9]/g, '');
+          if (!clean || App.STOP_WORDS.has(clean)) continue;
+          tokens.push(clean);
+          // Add synonyms
+          if (App.SYNONYMS[clean]) {
+            for (const syn of App.SYNONYMS[clean]) tokens.push(syn);
+          }
+        }
+        return tokens;
+      }
+
+      // Build n-grams from tokens
+      ngrams(tokens, n) {
+        const grams = [];
+        for (let i = 0; i <= tokens.length - n; i++) {
+          grams.push(tokens.slice(i, i + n).join('_'));
+        }
+        return grams;
+      }
+
       // Build knowledge base from training sentences
-      // Supports two formats:
-      // 1. Q&A pairs: "Q: what is your name? A: my name is rohan"
-      // 2. Plain sentences (stored as-is for keyword retrieval)
+      // Auto-generates Q&A pairs from plain sentences
       buildKnowledgeBase(sentences) {
         this.knowledgeBase = [];
         this.wordDocFreq = {};
@@ -1473,56 +1518,147 @@ name is rohan hello my</textarea>
           if (!trimmed) continue;
 
           const lower = trimmed.toLowerCase();
+
+          // Check for explicit Q:A format
           const qaMatch = lower.match(/^q[:\s]+(.+?)\s+a[:\s]+(.+)$/i);
           if (qaMatch) {
             const question = qaMatch[1].trim();
             const answer = qaMatch[2].trim();
-            const words = question.split(/\s+/).filter(w => w.length > 0);
-            this.knowledgeBase.push({ type: 'qa', question, answer, words });
-            const uniq = new Set(words);
-            for (const w of uniq) this.wordDocFreq[w] = (this.wordDocFreq[w] || 0) + 1;
-          } else {
-            const words = lower.split(/\s+/).filter(w => w.length > 0);
-            this.knowledgeBase.push({ type: 'sentence', text: trimmed, words });
-            const uniq = new Set(words);
-            for (const w of uniq) this.wordDocFreq[w] = (this.wordDocFreq[w] || 0) + 1;
+            const qTokens = this.extractTokens(question);
+            this.knowledgeBase.push({
+              type: 'qa',
+              question,
+              answer,
+              tokens: qTokens,
+              bigrams: this.ngrams(qTokens, 2),
+              text: trimmed
+            });
+            for (const w of new Set(qTokens)) this.wordDocFreq[w] = (this.wordDocFreq[w] || 0) + 1;
+            continue;
           }
+
+          // Plain sentence: store as sentence + auto-generate Q&A variants
+          const tokens = this.extractTokens(lower);
+          const bigrams = this.ngrams(tokens, 2);
+
+          // Store raw sentence for retrieval
+          this.knowledgeBase.push({
+            type: 'sentence',
+            text: trimmed,
+            tokens,
+            bigrams,
+            answer: trimmed
+          });
+
+          // Auto-generate Q&A pairs from sentence patterns
+          const words = lower.split(/\s+/).filter(w => w.length > 0);
+          this.autoGenerateQA(words, trimmed);
+
+          for (const w of new Set(tokens)) this.wordDocFreq[w] = (this.wordDocFreq[w] || 0) + 1;
         }
       }
 
-      // Retrieve answer by keyword overlap matching
+      // Auto-generate question-answer pairs from sentence content
+      autoGenerateQA(words, sentence) {
+        const lowerSent = sentence.toLowerCase();
+
+        // Pattern: "hello ..." -> Q: greeting word? A: hello ...
+        if (words.includes('hello') || words.includes('hi') || words.includes('hey')) {
+          this.knowledgeBase.push({
+            type: 'qa',
+            question: 'what is the greeting word',
+            answer: sentence,
+            tokens: this.extractTokens('greeting word hello'),
+            bigrams: this.ngrams(this.extractTokens('greeting word hello'), 2),
+            text: sentence
+          });
+        }
+
+        // Pattern: "my name is ..." -> Q: what is your name? A: my name is ...
+        const nameMatch = lowerSent.match(/(?:my\s+name\s+is|i\s+am|name\s+is)\s+(.+)/i);
+        if (nameMatch) {
+          const name = nameMatch[1].trim();
+          this.knowledgeBase.push({
+            type: 'qa',
+            question: 'what is your name',
+            answer: sentence,
+            tokens: this.extractTokens('what your name'),
+            bigrams: this.ngrams(this.extractTokens('what your name'), 2),
+            text: sentence
+          });
+          this.knowledgeBase.push({
+            type: 'qa',
+            question: 'who are you',
+            answer: sentence,
+            tokens: this.extractTokens('who are you'),
+            bigrams: this.ngrams(this.extractTokens('who are you'), 2),
+            text: sentence
+          });
+        }
+
+        // Pattern: "how are you" -> Q: how are you? A: ...
+        if (lowerSent.includes('how are you') || lowerSent.includes('how are')) {
+          this.knowledgeBase.push({
+            type: 'qa',
+            question: 'how are you',
+            answer: sentence,
+            tokens: this.extractTokens('how are you'),
+            bigrams: this.ngrams(this.extractTokens('how are you'), 2),
+            text: sentence
+          });
+        }
+      }
+
+      // Retrieve answer using multi-strategy matching
       retrieveAnswer(query) {
         if (!this.knowledgeBase || this.knowledgeBase.length === 0) return null;
 
-        const queryWords = query.split(/\s+/).filter(w => w.length > 0);
-        if (queryWords.length === 0) return null;
+        const qTokens = this.extractTokens(query);
+        if (qTokens.length === 0) return null;
+        const qBigrams = this.ngrams(qTokens, 2);
+        const qSet = new Set(qTokens);
 
         let bestMatch = null;
         let bestScore = -1;
 
         for (const entry of this.knowledgeBase) {
-          const targetWords = entry.type === 'qa' ? entry.words : entry.words;
-          const targetSet = new Set(targetWords);
+          let score = 0;
 
-          // Weighted overlap: rare words (in query) count more
-          let overlap = 0;
-          let queryWeightSum = 0;
-          for (const w of queryWords) {
-            const idf = 1 / (1 + Math.log(1 + this.wordDocFreq[w] || 1));
-            queryWeightSum += idf;
-            if (targetSet.has(w)) overlap += idf;
+          // Strategy 1: Exact token overlap (with synonym expansion)
+          const eTokens = entry.tokens || [];
+          const eSet = new Set(eTokens);
+          let tokenOverlap = 0;
+          for (const t of qTokens) {
+            if (eSet.has(t)) tokenOverlap++;
           }
+          score += tokenOverlap * 1.0;
 
-          // Score: weighted overlap / weighted max length
-          const score = overlap / Math.max(queryWeightSum, targetWords.length * 0.5);
+          // Strategy 2: Bigram overlap (catches phrase matches)
+          const eBigrams = entry.bigrams || [];
+          const eBiSet = new Set(eBigrams);
+          let biOverlap = 0;
+          for (const b of qBigrams) {
+            if (eBiSet.has(b)) biOverlap++;
+          }
+          score += biOverlap * 2.0; // bigrams weighted higher
+
+          // Strategy 3: Substring containment
+          const qRaw = query.toLowerCase().replace(/[^a-z0-9\s]/g, '');
+          const eRaw = (entry.text || entry.question || '').toLowerCase().replace(/[^a-z0-9\s]/g, '');
+          if (eRaw.includes(qRaw) || qRaw.includes(eRaw)) score += 3.0;
+
+          // Normalize by query length
+          const norm = Math.max(qTokens.length + qBigrams.length * 2, 1);
+          score = score / norm;
+
           if (score > bestScore) {
             bestScore = score;
             bestMatch = entry;
           }
         }
 
-        // Threshold: require strong overlap to avoid hallucination
-        if (bestScore >= 0.4) {
+        // Lower threshold for better recall
+        if (bestScore >= 0.15 && bestMatch) {
           return bestMatch.type === 'qa' ? bestMatch.answer : bestMatch.text;
         }
         return null;
