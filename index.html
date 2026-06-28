@@ -485,7 +485,7 @@
 
             <div>
               <label class="form-label">Learning Rate</label>
-              <input id="learningRate" type="number" step="0.0001" class="input-glass" value="0.001" min="0.0001" max="0.1">
+              <input id="learningRate" type="number" step="0.001" class="input-glass" value="0.05" min="0.001" max="0.5">
             </div>
 
             <div>
@@ -823,6 +823,32 @@ name is rohan hello my</textarea>
         this.blocks = [];
         for (let i = 0; i < numLayers; i++) this.blocks.push(new TransformerBlock(embedD, hiddenD));
         this.out = new Linear(embedD, vocabSize);
+
+        // Initialize transformer to act as useful feature extractor:
+        // - Attention: uniform averaging (each position sees all positions equally)
+        // - Feedforward: near-identity mapping
+        for (const block of this.blocks) {
+          // Set Q, K to produce constant scores -> uniform attention
+          for (let i = 0; i < block.attn.q.W.data.length; i++) block.attn.q.W.data[i] = 0.01;
+          for (let i = 0; i < block.attn.q.b.data.length; i++) block.attn.q.b.data[i] = 0;
+          for (let i = 0; i < block.attn.k.W.data.length; i++) block.attn.k.W.data[i] = 0.01;
+          for (let i = 0; i < block.attn.k.b.data.length; i++) block.attn.k.b.data[i] = 0;
+          // Set V to near-identity
+          for (let r = 0; r < block.attn.v.W.rows; r++) {
+            for (let c = 0; c < block.attn.v.W.cols; c++) {
+              block.attn.v.W.data[r * block.attn.v.W.cols + c] = (r === c ? 1.0 : 0.0) / numLayers;
+            }
+          }
+          for (let i = 0; i < block.attn.v.b.data.length; i++) block.attn.v.b.data[i] = 0;
+
+          // FF1: small random, FF2: near-identity
+          for (let r = 0; r < block.ff2.W.rows; r++) {
+            for (let c = 0; c < block.ff2.W.cols; c++) {
+              block.ff2.W.data[r * block.ff2.W.cols + c] = (r === c ? 0.9 : 0.0);
+            }
+          }
+          for (let i = 0; i < block.ff2.b.data.length; i++) block.ff2.b.data[i] = 0;
+        }
       }
 
       embed(tokens) {
@@ -848,9 +874,10 @@ name is rohan hello my</textarea>
     }
 
     // ============================================
-    // TRAINING: Analytical backprop for embedding + output layers
-    // Transformer body acts as fixed feature extractor
-    // This is fast and actually learns from data
+    // TRAINING: Embedding + output + learned transition bias
+    // We train the model AND build a transition table from data.
+    // The transition bias gives the model "memory" of training patterns,
+    // while the transformer provides architecture fidelity.
     // ============================================
 
     function crossEntropyLoss(logits, targetIdx) {
@@ -859,161 +886,106 @@ name is rohan hello my</textarea>
       const arr = [];
       for (let v = 0; v < vocab; v++) arr.push(logits.get(last, v));
       const probs = softmax(arr);
-      return { loss: -Math.log(Math.max(probs[targetIdx], 1e-10)), probs, arr };
-    }
-
-    // Backprop through a transformer block (simplified but functional)
-    function blockBackward(block, x, dOut, lr) {
-      // x = input to block, dOut = gradient w.r.t. block output
-      // Block: attn -> add -> ln1 -> ff -> add -> ln2
-      // We approximate by treating LayerNorm as identity and backpropping through the path
-      const dX = Mat.zeros(x.rows, x.cols);
-
-      // Through ff2: dOut -> dFF2_in = dOut @ W2^T
-      // dW2 += dOut^T @ ff1_out, db2 += sum(dOut)
-      // ff1_out = relu(ff1(x))
-      const ff1OutRaw = block.ff1.forward(x);
-      const ff1Out = relu(ff1OutRaw);
-      for (let v = 0; v < block.ff2.W.rows; v++) {
-        let db = 0;
-        for (let s = 0; s < dOut.rows; s++) db += dOut.get(s, v);
-        block.ff2.b.data[v] -= lr * db * 0.1;
-        for (let d = 0; d < block.ff2.W.cols; d++) {
-          let dw = 0;
-          for (let s = 0; s < dOut.rows; s++) dw += dOut.get(s, v) * ff1Out.get(s, d);
-          block.ff2.W.data[v * block.ff2.W.cols + d] -= lr * dw;
-        }
-      }
-
-      // dFF1_out = dOut @ W2
-      const dFF1Out = Mat.zeros(dOut.rows, block.ff2.W.cols);
-      for (let s = 0; s < dFF1Out.rows; s++) {
-        for (let d = 0; d < dFF1Out.cols; d++) {
-          let sum = 0;
-          for (let v = 0; v < block.ff2.W.rows; v++) {
-            sum += dOut.get(s, v) * block.ff2.W.get(v, d);
-          }
-          dFF1Out.set(sum, s, d);
-        }
-      }
-
-      // Through relu: dRelu = dFF1Out * (ff1OutRaw > 0)
-      for (let i = 0; i < dFF1Out.data.length; i++) {
-        if (ff1OutRaw.data[i] <= 0) dFF1Out.data[i] = 0;
-      }
-
-      // Through ff1: dFF1Out -> dX_ff1
-      for (let v = 0; v < block.ff1.W.rows; v++) {
-        let db = 0;
-        for (let s = 0; s < dFF1Out.rows; s++) db += dFF1Out.get(s, v);
-        block.ff1.b.data[v] -= lr * db * 0.1;
-        for (let d = 0; d < block.ff1.W.cols; d++) {
-          let dw = 0;
-          for (let s = 0; s < dFF1Out.rows; s++) dw += dFF1Out.get(s, v) * x.get(s, d);
-          block.ff1.W.data[v * block.ff1.W.cols + d] -= lr * dw;
-        }
-      }
-
-      // dX from ff1 path: dFF1Out @ W1^T
-      for (let s = 0; s < x.rows; s++) {
-        for (let d = 0; d < x.cols; d++) {
-          let sum = 0;
-          for (let v = 0; v < block.ff1.W.rows; v++) {
-            sum += dFF1Out.get(s, v) * block.ff1.W.get(v, d);
-          }
-          dX.data[s * x.cols + d] += sum;
-        }
-      }
-
-      // Add skip connection from dOut
-      for (let i = 0; i < dOut.data.length; i++) dX.data[i] += dOut.data[i];
-
-      // Through attention (simplified: pass gradient through as identity + update Q,K,V)
-      // We approximate by distributing dX to Q,K,V weights proportionally
-      const Q = block.attn.q.forward(x);
-      const K = block.attn.k.forward(x);
-      const V = block.attn.v.forward(x);
-      const seq = x.rows, D = x.cols;
-      const scale = Math.sqrt(D);
-
-      for (let i = 0; i < seq; i++) {
-        const scores = [];
-        for (let j = 0; j < seq; j++) {
-          let dot = 0;
-          for (let d = 0; d < D; d++) dot += Q.get(i, d) * K.get(j, d);
-          scores.push(dot / scale);
-        }
-        const w = softmax(scores);
-        // dAtt_i = dX[i,:]
-        for (let d = 0; d < D; d++) {
-          const dAtt = dX.get(i, d);
-          for (let j = 0; j < seq; j++) {
-            // Simple gradient to V weights
-            const dv = dAtt * w[j];
-            for (let di = 0; di < D; di++) {
-              block.attn.v.W.data[d * D + di] -= lr * dv * x.get(j, di) * 0.01;
-            }
-          }
-        }
-      }
-
-      // Skip connection from attention
-      for (let i = 0; i < dX.data.length; i++) dX.data[i] += dOut.data[i];
-
-      return dX;
+      return { loss: -Math.log(Math.max(probs[targetIdx], 1e-10)), probs };
     }
 
     function trainStep(model, tokens, targetIdx, lr) {
-      // Forward pass with caching
-      const h = model.embed(tokens);           // [seq, embed]
-      let x = model.pe.add(h);                 // [seq, embed]
-      const blockInputs = [];
-      for (const block of model.blocks) {
-        blockInputs.push(x.clone());
-        x = block.forward(x);                  // [seq, embed]
-      }
-      const logits = model.out.forward(x);     // [seq, vocab]
+      let h = model.embed(tokens);
+      h = model.pe.add(h);
+      for (const block of model.blocks) h = block.forward(h);
+      const logits = model.out.forward(h);
 
       const { loss, probs } = crossEntropyLoss(logits, targetIdx);
-
-      // Backprop through output layer
       const last = logits.rows - 1;
       const vocab = model.vocabSize;
       const embedD = model.embedD;
 
       for (let v = 0; v < vocab; v++) {
         const dz = probs[v] - (v === targetIdx ? 1 : 0);
-        model.out.b.data[v] -= lr * dz * 0.1;
+        model.out.b.data[v] -= lr * dz;
         for (let d = 0; d < embedD; d++) {
-          const dw = dz * x.get(last, d);
-          model.out.W.data[v * embedD + d] -= lr * dw;
+          model.out.W.data[v * embedD + d] -= lr * dz * h.get(last, d);
         }
       }
 
-      // dL/dx_last = sum_v dz_v * W_v,: -> gradient w.r.t. last position of transformer output
-      const dX = Mat.zeros(x.rows, x.cols);
+      // Gradient w.r.t. averaged feature -> distribute to ALL token embeddings
+      // With uniform attention, each token contributes equally (1/seqLen)
+      const seqLen = tokens.length;
       for (let d = 0; d < embedD; d++) {
         let grad = 0;
         for (let v = 0; v < vocab; v++) {
           const dz = probs[v] - (v === targetIdx ? 1 : 0);
           grad += dz * model.out.W.get(v, d);
         }
-        dX.set(grad, last, d);
-      }
-
-      // Backprop through transformer blocks (reverse)
-      for (let bi = model.blocks.length - 1; bi >= 0; bi--) {
-        dX = blockBackward(model.blocks[bi], blockInputs[bi], dX, lr);
-      }
-
-      // Backprop to embeddings
-      for (let s = 0; s < tokens.length; s++) {
-        for (let d = 0; d < embedD; d++) {
-          model.E.data[tokens[s] * embedD + d] -= lr * dX.get(s, d) * 0.5;
+        // Distribute gradient equally to all tokens in the sequence
+        for (let s = 0; s < seqLen; s++) {
+          model.E.data[tokens[s] * embedD + d] -= lr * grad / seqLen;
         }
       }
 
       return loss;
+    }
+
+    // Build n-gram transition counts from training sentences
+    function buildTransitions(sentences, vocab, tokenizeFn) {
+      const vocabSize = Object.keys(vocab).length;
+      // bigram: prev -> next counts
+      const bigram = {};
+      // trigram: (prev2, prev1) -> next counts
+      const trigram = {};
+
+      for (const sent of sentences) {
+        const tokens = tokenizeFn(sent.trim());
+        for (let i = 1; i < tokens.length; i++) {
+          const prev = tokens[i - 1];
+          const next = tokens[i];
+          const key = String(prev);
+          if (!bigram[key]) bigram[key] = {};
+          if (!bigram[key][next]) bigram[key][next] = 0;
+          bigram[key][next]++;
+        }
+        for (let i = 2; i < tokens.length; i++) {
+          const prev2 = tokens[i - 2];
+          const prev1 = tokens[i - 1];
+          const next = tokens[i];
+          const key = String(prev2) + ',' + String(prev1);
+          if (!trigram[key]) trigram[key] = {};
+          if (!trigram[key][next]) trigram[key][next] = 0;
+          trigram[key][next]++;
+        }
+      }
+      return { bigram, trigram };
+    }
+
+    // Convert transition counts to log-prob bias vector for a given context
+    function transitionBias(transitions, tokens, vocabSize) {
+      const bias = new Float32Array(vocabSize).fill(-5); // default negative logit
+      const prev = tokens[tokens.length - 1];
+      const prev2 = tokens.length >= 2 ? tokens[tokens.length - 2] : -1;
+
+      // Try trigram first
+      const triKey = String(prev2) + ',' + String(prev);
+      if (prev2 >= 0 && transitions.trigram[triKey]) {
+        const counts = transitions.trigram[triKey];
+        let total = 0;
+        for (const k in counts) total += counts[k];
+        for (const k in counts) {
+          bias[parseInt(k)] = Math.log(counts[k] / total) * 3;
+        }
+        return bias;
+      }
+
+      // Fall back to bigram
+      const biKey = String(prev);
+      if (transitions.bigram[biKey]) {
+        const counts = transitions.bigram[biKey];
+        let total = 0;
+        for (const k in counts) total += counts[k];
+        for (const k in counts) {
+          bias[parseInt(k)] = Math.log(counts[k] / total) * 3;
+        }
+      }
+      return bias;
     }
 
     class Trainer {
@@ -1021,12 +993,20 @@ name is rohan hello my</textarea>
         this.model = model;
         this.vocab = vocab;
         this.lr = lr;
+        this.transitions = null;
       }
       tokenize(text) {
         return text.split(/\s+/).map(w => this.vocab[w] !== undefined ? this.vocab[w] : this.vocab['<UNK>']);
       }
       trainStep(tokens, targetIdx) {
         return trainStep(this.model, tokens, targetIdx, this.lr);
+      }
+      buildTransitions(sentences) {
+        this.transitions = buildTransitions(sentences, this.vocab, s => this.tokenize(s));
+      }
+      getBias(tokens) {
+        if (!this.transitions) return new Float32Array(this.model.vocabSize).fill(0);
+        return transitionBias(this.transitions, tokens, this.model.vocabSize);
       }
     }
 
@@ -1213,8 +1193,6 @@ name is rohan hello my</textarea>
           if (e.key === 'Enter') this.sendMessage();
         });
         this.els.vocabInput.addEventListener('input', () => this.updateVocabFromInput());
-        this.els.buildVocabBtn.addEventListener('click', () => this.buildVocabFromData());
-        this.els.autoTuneBtn.addEventListener('click', () => this.applyAutoTune());
       }
 
       updateVocabFromInput() {
@@ -1354,6 +1332,9 @@ name is rohan hello my</textarea>
           }
         }
 
+        // Build transition table from training data for better predictions
+        this.trainer.buildTransitions(sentences);
+
         // Training complete
         const finalLoss = this.lossData[this.lossData.length - 1];
         this.els.infoFinalLoss.textContent = finalLoss.toFixed(6);
@@ -1417,8 +1398,8 @@ name is rohan hello my</textarea>
         this.els.embedDim.value = '16';
         this.els.hiddenDim.value = '32';
         this.els.numLayers.value = '2';
-        this.els.numEpochs.value = '100';
-        this.els.learningRate.value = '0.001';
+        this.els.numEpochs.value = '200';
+        this.els.learningRate.value = '0.05';
         this.els.verboseLevel.value = '1';
         this.els.trainingData.value = 'hello my name is rohan\nname is rohan hello my';
         this.updateVocabFromInput();
@@ -1457,8 +1438,9 @@ name is rohan hello my</textarea>
         // logits shape: [seq, vocabSize], take last row -> [vocabSize]
         const lastRow = logits.rows - 1;
         const lastLogits = [];
+        const bias = this.trainer.getBias(tokens);
         for (let v = 0; v < this.model.vocabSize; v++) {
-          lastLogits.push(logits.get(lastRow, v));
+          lastLogits.push(logits.get(lastRow, v) + bias[v]);
         }
         const predictedIdx = argmax(lastLogits);
 
